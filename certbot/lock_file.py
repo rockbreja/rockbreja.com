@@ -1,185 +1,78 @@
-# $Id: lock_file.py 18 2007-10-24 04:47:12Z horcicka $
-
-'''Lock file manipulation.
-
-Lock file is a traditional means of synchronization among processes. In
-this module it is implemented as an empty regular file exclusively
-locked using fcntl.lockf. When it is to be released it is removed by
-default. However, if all cooperating processes turn off the removal,
-they get a guaranteed order of acquisitions and better scalability.
-
-Example: Checking if at most one instance of the script is running
-
-    import sys
-    from lock_file import LockFile, LockError
-
-    try:
-        lock_f = LockFile('/var/run/app.lock')
-    except LockError:
-        sys.exit('The script is already running')
-
-    try:
-        do_something_useful()
-    finally:
-        lock_f.release()
-
-Example: Waiting for the lock file acquisition
-
-    from lock_file import LockFile
-
-    lock_f = LockFile('/var/run/app.lock', wait = True)
-    try:
-        do_something_useful()
-    finally:
-        lock_f.release()
-
-Example: Waiting for the lock file acquisition (in Python 2.5 and
-higher)
-
-    from __future__ import with_statement
-    from lock_file import LockFile
-
-    with LockFile('/var/run/app.lock', wait = True):
-        do_something_useful()
-'''
-
-__all__ = 'LockError', 'LockFile'
-
+"""Implements simple UNIX file locking."""
 import errno
 import fcntl
 import os
 
-
-class LockError(Exception):
-    '''Lock error.
-
-    Raised when a lock file acquisition is unsuccessful because the lock
-    file is held by another process.
-    '''
-
-    def __init__(self, message):
-        Exception.__init__(self, message)
-
-
-    def __repr__(self):
-        return self.__class__.__name__ + '(' + repr(self.args[0]) + ')'
+from certbot import errors
 
 
 class LockFile(object):
-    '''Lock file.
+    """A UNIX file lock.
 
-    This class represents an acquired lock file. After its releasing
-    most methods lose their sense and raise a ValueError.
-    '''
+    This class implements a simple UNIX lock file to provide
+    synchronization between processes. This lock file cannot be used to
+    provide synchronization between threads. This class works best as a
+    context manager to help ensure the lock is properly cleaned up and
+    released.
 
-    def __init__(self, path, wait = False, remove = True):
-        '''Initialize and acquire the lock file.
+    This lock file is based on the lock_file package by Martin Horcicka.
 
-        Creates and locks the specified file. The wait argument can be
-        set to True to wait until the lock file can be acquired. The
-        remove argument can be set to False to keep the file after
-        releasing.
-
-        Raises LockError if the wait argument is False and the lock file
-        is held by another process. Raises OSError or IOError if any
-        other error occurs. In particular, raises IOError with the errno
-        attribute set to errno.EINTR, if waiting for the acquisition is
-        interrupted by a signal.
-        '''
-
-        object.__init__(self)
-        self._path = path
+    """
+    def __init__(self, path):
         self._fd = None
-        self._remove = remove
+        self._path = path
 
+    def __enter__(self):
+        self.acquire()
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.release()
+
+    def __repr__(self):
+        return "{0}({1})".format(self.__class__.__name__, self._path)
+
+    def acquire(self):
+        """Acquire the lock on the lockfile.
+
+        :raises .LockError: If the lock file is held by another process.
+
+        """
         # Acquire the lock file
         while self._fd is None:
             # Open the file
-            fd = os.open(path, os.O_CREAT | os.O_WRONLY, 0666)
+            fd = os.open(self._path, os.O_CREAT | os.O_WRONLY, 0666)
             try:
                 # Acquire an exclusive lock
-                if wait:
-                    fcntl.lockf(fd, fcntl.LOCK_EX)
-                else:
-                    try:
-                        fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    except IOError, e:
-                        if e.errno in (errno.EACCES, errno.EAGAIN):
-                            raise LockError(
-                                'Lock file is held by another process: '
-                                + repr(self._path))
-                        else:
-                            raise
-
+                try:
+                    fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except IOError, e:
+                    if e.errno in (errno.EACCES, errno.EAGAIN):
+                        raise errors.LockError(
+                            "Another instance of Certbot is already running.")
+                    else:
+                        raise
                 # Check if the locked file is the required one (it could
                 # have been removed and possibly recreated between the
                 # opening and the lock acquisition)
                 try:
-                    stat1 = os.stat(path)
+                    stat1 = os.stat(self._path)
                 except OSError, e:
                     if e.errno != errno.ENOENT:
                         raise
                 else:
                     stat2 = os.fstat(fd)
-                    if stat1.st_dev == stat2.st_dev \
-                        and stat1.st_ino == stat2.st_ino:
-
+                    if _is_same_file(stat1, stat2):
                         self._fd = fd
-
             finally:
                 # Close the file if it is not the required one
                 if self._fd is None:
                     os.close(fd)
 
-
-    def __enter__(self):
-        if self._fd is None:
-            raise ValueError('The lock file is released')
-
-        return self
-
-
-    def __repr__(self):
-        repr_str = '<'
-        if self._fd is None:
-            repr_str += 'released'
-        else:
-            repr_str += 'acquired'
-
-        repr_str += ' lock file ' + repr(self._path) + '>'
-        return repr_str
-
-
-    def get_path(self):
-        if self._fd is None:
-            raise ValueError('The lock file is released')
-
-        return self._path
-
-
-    def fileno(self):
-        if self._fd is None:
-            raise ValueError('The lock file is released')
-
-        return self._fd
-
-
     def release(self):
-        '''Release the lock file.
-
-        Removes (optionally) and closes the lock file.
-
-        Raises ValueError if the lock file is already released. Raises
-        OSError if any other error occurs.
-        '''
-
-        if self._fd is None:
-            raise ValueError('The lock file is already released')
-
+        """Release the lock file."""
         # Remove and close the file
         try:
-            if self._remove:
-                os.remove(self._path)
+            os.remove(self._path)
         finally:
             try:
                 os.close(self._fd)
@@ -187,5 +80,6 @@ class LockFile(object):
                 self._fd = None
 
 
-    def __exit__(self, exc_type, exc_value, traceback):
-        self.release()
+def _is_same_file(stat1, stat2):
+    """Do stat1 and stat2 refer to the same file?"""
+    return stat1.st_dev == stat2.st_dev and stat1.st_ino == stat2.st_ino
